@@ -69,3 +69,8 @@ The system consists of the following components:
 - Manual link failures
 - Congested links using traffic control (tc)
 - Controller-driven rerouting
+
+## 5. ONOS installtion
+```
+wget https://repo1.maven.org/maven2/org/onosproject/onos-releases/2.7.0/onos-2.7.0.tar.gz tar -xvzf onos-2.7.0.tar.gz
+```
