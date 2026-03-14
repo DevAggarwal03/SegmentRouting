@@ -8,10 +8,10 @@ class FatTreeTopo(Topo):
 
     def build(self):
 
-        s1 = self.addSwitch('s1')
-        s2 = self.addSwitch('s2')
-        s3 = self.addSwitch('s3')
-        s4 = self.addSwitch('s4')
+        s1 = self.addSwitch('s1', protocols='OpenFlow13')
+        s2 = self.addSwitch('s2', protocols='OpenFlow13')
+        s3 = self.addSwitch('s3', protocols='OpenFlow13')
+        s4 = self.addSwitch('s4', protocols='OpenFlow13')
 
         h1 = self.addHost('h1')
         h2 = self.addHost('h2')
@@ -36,8 +36,14 @@ if __name__ == '__main__':
 
     net = Mininet(
         topo=topo,
-        controller=lambda name: RemoteController(name, ip='127.0.0.1'),
-        link=TCLink
+	controller=None
+    )
+
+    c0 = net.addController(
+	'c0',
+	 controller=RemoteController,
+	 ip='127.0.0.1',
+	 port=6633
     )
 
     net.start()

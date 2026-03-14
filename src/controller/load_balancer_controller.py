@@ -17,6 +17,8 @@ class LoadBalancer(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
 
+        self.logger.info("Switch connected!")
+
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
@@ -50,7 +52,7 @@ class LoadBalancer(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-
+        self.logger.info("Packet received")
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
