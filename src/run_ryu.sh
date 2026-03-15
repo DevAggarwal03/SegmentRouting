@@ -2,4 +2,4 @@
 
 echo "Starting Ryu Controller..."
 
-ryu-manager controller/load_balancer_controller.py
+ryu-manager controller/mac_controller.py
