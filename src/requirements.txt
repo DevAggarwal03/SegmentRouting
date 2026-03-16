@@ -2,3 +2,4 @@ ryu
 networkx
 matplotlib
 numpy
+requests

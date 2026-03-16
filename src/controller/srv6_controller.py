@@ -1,42 +1,45 @@
 #!/usr/bin/env python3
 """
-sr_controller.py  —  SR-MPLS Controller (Ryu / OpenFlow 1.3)
--------------------------------------------------------------
-Implements Segment Routing over MPLS using explicit per-hop label
-push / swap / pop rules installed via OpenFlow 1.3.
+srv6_controller.py  —  SRv6 Controller (Ryu / OpenFlow 1.3)
+------------------------------------------------------------
+Implements Segment Routing over IPv6 (SRv6) emulation using OpenFlow.
 
-Segment model
-─────────────
-  • Every switch gets a unique MPLS label (its DPID, offset by LABEL_BASE).
-  • For a path [s1, s2, s3] the segment list is [label(s2), label(s3)].
-  • Ingress switch pushes the full label stack (outermost = next hop).
-  • Each transit switch swaps the top label for the next one (or pops on
-    the penultimate hop so the egress switch sees plain Ethernet/IP).
-  • Egress switch forwards to the destination host.
+Segment model (emulation strategy)
+────────────────────────────────────
+Real SRv6 uses a Segment Routing Header (SRH) extension header.
+OVS/OpenFlow 1.3 does not support SRH directly.
 
-Fast-reroute
-────────────
-  On a PortStatus DOWN event the controller:
-    1. Removes the affected link from the graph.
-    2. Recomputes all paths that traversed that link.
-    3. Reinstalls flow rules along the new paths (or logs "no backup").
+Emulation approach (standard in OF-based SRv6 research):
+  • Each switch is assigned a unique IPv6 Segment ID (SID).
+  • A routing state is encoded in the IPv6 dst field.
+  • At each hop the controller pre-installs a rule:
+      match(ipv6_dst = current_SID)  →  set_field(ipv6_dst = next_SID), output(port)
+  • The ingress host encapsulates traffic to the first SID.
+  • The egress switch matches the final SID and de-capsulates (sets ipv6_dst
+    back to the real host IPv6 address before forwarding).
 
-Metrics collected (written to /tmp/sr_mpls_metrics.json on exit)
-────────────────────────────────────────────────────────────────
-  • path_setup_latency_ms  : time from first PacketIn to FlowMod sent
-  • flow_rules_installed   : total OFPFlowMod messages sent
-  • reroute_events         : number of fast-reroute triggers
-  • reroute_latency_ms     : time from PortDown to last FlowMod of rereroute
+SID assignment:  fd00::<dpid>  (e.g. s3 with dpid=3 → fd00::3)
+Host IPv6:       fd00:1::<host_id>  (h1→fd00:1::1, h4→fd00:1::4)
+
+NOTE on paper disclosure: the SRH is emulated rather than transported;
+latency and overhead numbers reflect the OpenFlow control plane rather
+than a native SRv6 data plane. This must be declared in the paper.
+
+Metrics collected (written to /tmp/srv6_metrics.json on exit)
+───────────────────────────────────────────────────────────
+  • path_setup_latency_ms
+  • flow_rules_installed
+  • reroute_events
+  • reroute_latency_ms
 
 Run
 ───
-  ryu-manager sr_controller.py --observe-links
+  ryu-manager srv6_controller.py --observe-links
 """
 
 import json
 import time
 import atexit
-from collections import defaultdict
 
 import networkx as nx
 
@@ -44,41 +47,49 @@ from ryu.base import app_manager
 from ryu.controller import ofp_event, dpset
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
-from ryu.ofproto import ofproto_v1_3, ether
-from ryu.lib.packet import packet, ethernet, ipv4, arp
+from ryu.ofproto import ofproto_v1_3, ether, inet
+from ryu.lib.packet import packet, ethernet, ipv6, arp
 from ryu.topology import event as topo_event
 from ryu.topology.api import get_switch, get_link
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-LABEL_BASE   = 100          # MPLS labels start at 100 (avoids special-purpose range)
-FLOW_PRIO_SR = 200          # SR forwarding rules
-FLOW_PRIO_ARP= 100          # ARP flood rules
-FLOW_PRIO_DEFAULT = 0       # Table-miss → controller
+SID_PREFIX     = 'fd00::'          # fd00::<dpid>   e.g. fd00::3
+HOST_PREFIX    = 'fd00:1::'        # fd00:1::<host#>
+FLOW_PRIO_SRv6 = 200
+FLOW_PRIO_DEFAULT = 0
+ETH_TYPE_IPV6  = ether.ETH_TYPE_IPV6
 
 
-class SRMPLSController(app_manager.RyuApp):
-    """Segment Routing over MPLS — Ryu SDN Controller."""
+def _sid(dpid: int) -> str:
+    """Return the IPv6 SID for a switch: fd00::<dpid>."""
+    return f'{SID_PREFIX}{dpid}'
+
+
+def _host_ipv6(host_id: int) -> str:
+    """Return host IPv6 address: fd00:1::<host_id>."""
+    return f'{HOST_PREFIX}{host_id}'
+
+
+class SRv6Controller(app_manager.RyuApp):
+    """Segment Routing over IPv6 (emulated) — Ryu SDN Controller."""
 
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
-
     _CONTEXTS = {'dpset': dpset.DPSet}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.dpset       = kwargs['dpset']
-        self.net         = nx.DiGraph()          # switch topology graph
-        self.host_loc    = {}                    # mac → (dpid, port)
-        self.installed   = {}                    # (src_mac, dst_mac) → path
+        self.dpset    = kwargs['dpset']
+        self.net      = nx.DiGraph()
+        self.host_loc = {}          # mac → (dpid, port, ipv6_addr)
+        self.installed= {}          # (src_mac, dst_mac) → path
 
-        # ── metrics ────────────────────────────────────────────────────────
         self._metrics = {
             'path_setup_latency_ms': [],
             'flow_rules_installed':  0,
             'reroute_events':        0,
             'reroute_latency_ms':    [],
         }
-        self._pkt_in_ts = {}    # (src_mac, dst_mac) → timestamp of first PacketIn
 
         atexit.register(self._dump_metrics)
 
@@ -93,12 +104,11 @@ class SRMPLSController(app_manager.RyuApp):
         parser = dp.ofproto_parser
         dpid   = dp.id
 
-        self.logger.info('[SR-MPLS] Switch connected: dpid=%s  label=%d',
-                         dpid, self._label(dpid))
-
+        self.logger.info('[SRv6] Switch connected: dpid=%s  SID=%s',
+                         dpid, _sid(dpid))
         self.net.add_node(dpid)
 
-        # Table-miss: send to controller
+        # Table-miss → controller
         self._add_flow(dp, FLOW_PRIO_DEFAULT,
                        parser.OFPMatch(),
                        [parser.OFPActionOutput(ofp.OFPP_CONTROLLER,
@@ -119,13 +129,11 @@ class SRMPLSController(app_manager.RyuApp):
     def _rebuild_topology(self):
         switches = [s.dp.id for s in get_switch(self, None)]
         self.net.add_nodes_from(switches)
-
         for lnk in get_link(self, None):
             src, dst = lnk.src.dpid, lnk.dst.dpid
             self.net.add_edge(src, dst, port=lnk.src.port_no)
             self.net.add_edge(dst, src, port=lnk.dst.port_no)
-
-        self.logger.info('[SR-MPLS] Topology: %d switches, %d directed links',
+        self.logger.info('[SRv6] Topology: %d switches, %d links',
                          self.net.number_of_nodes(), self.net.number_of_edges())
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -141,58 +149,46 @@ class SRMPLSController(app_manager.RyuApp):
         port   = msg.desc.port_no
 
         if reason != ofp.OFPPR_DELETE and msg.desc.state & ofp.OFPPS_LINK_DOWN:
-            self.logger.warning('[SR-MPLS] PortDown dpid=%s port=%s — fast-reroute',
+            self.logger.warning('[SRv6] PortDown dpid=%s port=%s — fast-reroute',
                                 dp.id, port)
             t0 = time.time()
             self._fast_reroute(dp.id, port)
             elapsed = (time.time() - t0) * 1000
             self._metrics['reroute_events']    += 1
             self._metrics['reroute_latency_ms'].append(round(elapsed, 3))
-            self.logger.info('[SR-MPLS] Reroute complete in %.1f ms', elapsed)
+            self.logger.info('[SRv6] Reroute complete in %.1f ms', elapsed)
 
     def _fast_reroute(self, failed_dpid, failed_port):
-        """Remove the failed link from the graph and reinstall affected paths."""
-        # Identify and remove the failed edge
         to_remove = [(u, v) for u, v, d in self.net.edges(data=True)
                      if u == failed_dpid and d.get('port') == failed_port]
         for u, v in to_remove:
             self.net.remove_edge(u, v)
-            # Remove reverse too (undirected failure)
             if self.net.has_edge(v, u):
                 self.net.remove_edge(v, u)
 
-        # Reinstall every path that went through the failed link
         stale = {k: v for k, v in self.installed.items()
-                 if self._path_uses_link(v, failed_dpid, failed_port)}
+                 if failed_dpid in v}
 
-        for (src_mac, dst_mac), old_path in stale.items():
+        for (src_mac, dst_mac), _ in stale.items():
             del self.installed[(src_mac, dst_mac)]
 
             if dst_mac not in self.host_loc:
                 continue
-            dst_dpid, dst_port = self.host_loc[dst_mac]
-            src_dpid, _        = self.host_loc.get(src_mac, (None, None))
-            if src_dpid is None:
+            dst_dpid, dst_port, dst_ipv6 = self.host_loc[dst_mac]
+            if src_mac not in self.host_loc:
                 continue
+            src_dpid, _, _ = self.host_loc[src_mac]
 
             try:
                 new_path = nx.dijkstra_path(self.net, src_dpid, dst_dpid)
             except nx.NetworkXNoPath:
-                self.logger.error('[SR-MPLS] No backup path %s → %s',
+                self.logger.error('[SRv6] No backup path %s → %s',
                                   src_mac, dst_mac)
                 continue
 
-            self._install_sr_path(new_path, dst_port, src_mac, dst_mac)
+            self._install_srv6_path(new_path, dst_port, dst_ipv6,
+                                    src_mac, dst_mac)
             self.installed[(src_mac, dst_mac)] = new_path
-            self.logger.info('[SR-MPLS] Rerouted %s→%s via %s',
-                             src_mac, dst_mac, new_path)
-
-    @staticmethod
-    def _path_uses_link(path, dpid, port):
-        for i in range(len(path) - 1):
-            if path[i] == dpid:
-                return True
-        return False
 
     # ══════════════════════════════════════════════════════════════════════════
     # 4.  Packet-In Handler
@@ -200,41 +196,45 @@ class SRMPLSController(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        msg    = ev.msg
-        dp     = msg.datapath
-        ofp    = dp.ofproto
-        parser = dp.ofproto_parser
-        dpid   = dp.id
-        in_port= msg.match['in_port']
+        msg     = ev.msg
+        dp      = msg.datapath
+        ofp     = dp.ofproto
+        parser  = dp.ofproto_parser
+        dpid    = dp.id
+        in_port = msg.match['in_port']
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
         if eth is None:
-            self.logger.debug('[SR-MPLS] No Ethernet protocol in PacketIn from %s', dp.id)
             return
 
-        src, dst = eth.src, eth.dst
+        src_mac, dst_mac = eth.src, eth.dst
 
-        # Learn host location
-        self.host_loc[src] = (dpid, in_port)
-
-        # Handle ARP with flood
+        # ARP — extract IPv6 hint from NDP / use neighbour discovery
         if eth.ethertype == ether.ETH_TYPE_ARP:
+            self.host_loc.setdefault(src_mac, (dpid, in_port, None))
             self._flood(dp, in_port, msg)
             return
 
-        # Already installed — shouldn't get here but guard anyway
-        if (src, dst) in self.installed:
+        # Learn host location from IPv6 packet
+        ip6 = pkt.get_protocol(ipv6.ipv6)
+        if ip6:
+            src_ipv6 = ip6.src
+            self.host_loc[src_mac] = (dpid, in_port, src_ipv6)
+        else:
+            self.host_loc.setdefault(src_mac, (dpid, in_port, None))
+
+        if (src_mac, dst_mac) in self.installed:
             return
 
-        # Record first PacketIn timestamp for latency metric
-        self._pkt_in_ts[(src, dst)] = time.time()
-
-        if dst not in self.host_loc:
+        if dst_mac not in self.host_loc:
             self._flood(dp, in_port, msg)
             return
 
-        dst_dpid, dst_port = self.host_loc[dst]
+        dst_dpid, dst_port, dst_ipv6 = self.host_loc[dst_mac]
+        if dst_ipv6 is None:
+            self._flood(dp, in_port, msg)
+            return
 
         try:
             path = nx.dijkstra_path(self.net, dpid, dst_dpid)
@@ -242,53 +242,42 @@ class SRMPLSController(app_manager.RyuApp):
             self._flood(dp, in_port, msg)
             return
 
-        self.logger.info('[SR-MPLS] Path %s→%s : %s', src, dst, path)
+        self.logger.info('[SRv6] Path %s→%s : %s', src_mac, dst_mac, path)
 
-        t_before = time.time()
-        self._install_sr_path(path, dst_port, src, dst)
-        latency_ms = (time.time() - t_before) * 1000
-        self._metrics['path_setup_latency_ms'].append(round(latency_ms, 3))
+        t0 = time.time()
+        self._install_srv6_path(path, dst_port, dst_ipv6, src_mac, dst_mac)
+        self._metrics['path_setup_latency_ms'].append(
+            round((time.time() - t0) * 1000, 3))
 
-        self.installed[(src, dst)] = path
+        self.installed[(src_mac, dst_mac)] = path
 
-        # Send the buffered packet out
+        # Re-send buffered packet
+        out_port = (self.net[path[0]][path[1]]['port']
+                    if len(path) > 1 else dst_port)
         out = parser.OFPPacketOut(
             datapath=dp,
             buffer_id=msg.buffer_id,
             in_port=in_port,
-            actions=[parser.OFPActionOutput(
-                self.net[path[0]][path[1]]['port'] if len(path) > 1 else dst_port
-            )],
+            actions=[parser.OFPActionOutput(out_port)],
             data=msg.data if msg.buffer_id == ofp.OFP_NO_BUFFER else None,
         )
         dp.send_msg(out)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # 5.  SR-MPLS Path Installation
+    # 5.  SRv6 Path Installation
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _install_sr_path(self, path, dst_port, src_mac, dst_mac):
+    def _install_srv6_path(self, path, dst_port, dst_ipv6,
+                           src_mac, dst_mac):
         """
-        Install MPLS push/swap/pop rules along `path`.
+        Install per-hop IPv6-dst-rewrite rules that emulate SRv6 forwarding.
 
-        Segment list = labels of intermediate + egress switches.
-        Stack (outermost first):  label[1], label[2], ..., label[-1]
-
-        We use penultimate-hop popping (PHP): the second-to-last switch
-        pops the MPLS header so the egress switch forwards plain Ethernet.
+        Segment list  =  [SID(path[0]), SID(path[1]), ..., SID(path[-1])]
+        At each hop i:  match(ipv6_dst == SID[i]) → set(ipv6_dst = SID[i+1]), fwd
+        At final hop:   match(ipv6_dst == SID[-1]) → set(ipv6_dst = dst_ipv6), fwd to host
         """
-        if len(path) == 1:
-            # Src and dst on the same switch
-            dp = self._get_dp(path[0])
-            if dp:
-                parser = dp.ofproto_parser
-                match  = parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
-                self._add_flow(dp, FLOW_PRIO_SR, match,
-                               [parser.OFPActionOutput(dst_port)])
-            return
-
-        segment_labels = [self._label(sw) for sw in path[1:]]
-        n = len(path)
+        n    = len(path)
+        sids = [_sid(sw) for sw in path]
 
         for i, sw in enumerate(path):
             dp = self._get_dp(sw)
@@ -296,63 +285,57 @@ class SRMPLSController(app_manager.RyuApp):
                 continue
             parser = dp.ofproto_parser
 
+            if i == 0 and n == 1:
+                # Single-switch: direct forward
+                match  = parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
+                self._add_flow(dp, FLOW_PRIO_SRv6, match,
+                               [parser.OFPActionOutput(dst_port)])
+                continue
+
+            current_sid = sids[i]
+            out_port    = (self.net[sw][path[i + 1]]['port']
+                           if i < n - 1 else dst_port)
+
             if i == 0:
-                # ── Ingress: push full label stack ────────────────────────────
-                actions = []
-                # Push labels in reverse order (innermost pushed first)
-                for lbl in reversed(segment_labels):
-                    actions += [
-                        parser.OFPActionPushMpls(ether.ETH_TYPE_MPLS),
-                        parser.OFPActionSetField(mpls_label=lbl),
-                    ]
-                out_port = self.net[sw][path[i + 1]]['port']
-                actions.append(parser.OFPActionOutput(out_port))
-
-                match = parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac)
-                self._add_flow(dp, FLOW_PRIO_SR, match, actions)
-
-            elif i == n - 2:
-                # ── Penultimate hop: pop label (PHP) ──────────────────────────
-                out_port = self.net[sw][path[i + 1]]['port']
+                # ── Ingress: match Ethernet src/dst, rewrite ipv6_dst → SID[1] ─
                 match = parser.OFPMatch(
-                    eth_type=ether.ETH_TYPE_MPLS,
-                    mpls_label=segment_labels[i],
+                    eth_type=ETH_TYPE_IPV6,
+                    eth_src=src_mac,
+                    eth_dst=dst_mac,
                 )
                 actions = [
-                    parser.OFPActionPopMpls(ether.ETH_TYPE_IP),
+                    parser.OFPActionSetField(ipv6_dst=sids[1]),
                     parser.OFPActionOutput(out_port),
                 ]
-                self._add_flow(dp, FLOW_PRIO_SR, match, actions)
+                self._add_flow(dp, FLOW_PRIO_SRv6, match, actions)
 
-            elif i == n - 1:
-                # ── Egress: plain Ethernet forward to host ────────────────────
-                match = parser.OFPMatch(eth_dst=dst_mac)
-                self._add_flow(dp, FLOW_PRIO_SR, match,
-                               [parser.OFPActionOutput(dst_port)])
+            elif i < n - 1:
+                # ── Transit: match current SID, rewrite → next SID ────────────
+                match = parser.OFPMatch(
+                    eth_type=ETH_TYPE_IPV6,
+                    ipv6_dst=current_sid,
+                )
+                actions = [
+                    parser.OFPActionSetField(ipv6_dst=sids[i + 1]),
+                    parser.OFPActionOutput(out_port),
+                ]
+                self._add_flow(dp, FLOW_PRIO_SRv6, match, actions)
 
             else:
-                # ── Transit: swap label ───────────────────────────────────────
-                current_label = segment_labels[i]
-                next_label    = segment_labels[i + 1]
-                out_port      = self.net[sw][path[i + 1]]['port']
-
+                # ── Egress: match final SID, restore real dst IPv6, fwd to host ─
                 match = parser.OFPMatch(
-                    eth_type=ether.ETH_TYPE_MPLS,
-                    mpls_label=current_label,
+                    eth_type=ETH_TYPE_IPV6,
+                    ipv6_dst=current_sid,
                 )
                 actions = [
-                    parser.OFPActionSetField(mpls_label=next_label),
-                    parser.OFPActionOutput(out_port),
+                    parser.OFPActionSetField(ipv6_dst=dst_ipv6),
+                    parser.OFPActionOutput(dst_port),
                 ]
-                self._add_flow(dp, FLOW_PRIO_SR, match, actions)
+                self._add_flow(dp, FLOW_PRIO_SRv6, match, actions)
 
     # ══════════════════════════════════════════════════════════════════════════
     # 6.  Helpers
     # ══════════════════════════════════════════════════════════════════════════
-
-    @staticmethod
-    def _label(dpid):
-        return LABEL_BASE + dpid
 
     def _get_dp(self, dpid):
         return self.dpset.get(dpid)
@@ -385,13 +368,13 @@ class SRMPLSController(app_manager.RyuApp):
         dp.send_msg(out)
 
     def _dump_metrics(self):
-        path = '/tmp/sr_mpls_metrics.json'
+        path = '/tmp/srv6_metrics.json'
         lats = self._metrics['path_setup_latency_ms']
         rts  = self._metrics['reroute_latency_ms']
         out  = {
-            'mode':                   'sr-mpls',
-            'flow_rules_installed':   self._metrics['flow_rules_installed'],
-            'reroute_events':         self._metrics['reroute_events'],
+            'mode':                  'srv6',
+            'flow_rules_installed':  self._metrics['flow_rules_installed'],
+            'reroute_events':        self._metrics['reroute_events'],
             'path_setup_latency_ms': {
                 'samples': lats,
                 'avg':     round(sum(lats) / len(lats), 3) if lats else 0,
@@ -405,4 +388,4 @@ class SRMPLSController(app_manager.RyuApp):
         }
         with open(path, 'w') as f:
             json.dump(out, f, indent=2)
-        self.logger.info('[SR-MPLS] Metrics saved → %s', path)
+        self.logger.info('[SRv6] Metrics saved → %s', path)
