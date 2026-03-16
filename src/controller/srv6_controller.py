@@ -25,7 +25,7 @@ NOTE on paper disclosure: the SRH is emulated rather than transported;
 latency and overhead numbers reflect the OpenFlow control plane rather
 than a native SRv6 data plane. This must be declared in the paper.
 
-Metrics collected (written to /tmp/srv6_metrics.json on exit)
+Metrics collected (written to src/results/data/srv6_metrics.json on exit)
 ───────────────────────────────────────────────────────────
   • path_setup_latency_ms
   • flow_rules_installed
@@ -38,6 +38,7 @@ Run
 """
 
 import json
+import os
 import time
 import atexit
 
@@ -368,7 +369,10 @@ class SRv6Controller(app_manager.RyuApp):
         dp.send_msg(out)
 
     def _dump_metrics(self):
-        path = '/tmp/srv6_metrics.json'
+        _dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           'results', 'data')
+        os.makedirs(_dir, exist_ok=True)
+        path = os.path.join(_dir, 'srv6_metrics.json')
         lats = self._metrics['path_setup_latency_ms']
         rts  = self._metrics['reroute_latency_ms']
         out  = {

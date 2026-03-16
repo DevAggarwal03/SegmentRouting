@@ -21,7 +21,7 @@ Fast-reroute
     2. Recomputes all paths that traversed that link.
     3. Reinstalls flow rules along the new paths (or logs "no backup").
 
-Metrics collected (written to /tmp/sr_mpls_metrics.json on exit)
+Metrics collected (written to src/results/data/sr_mpls_metrics.json on exit)
 ────────────────────────────────────────────────────────────────
   • path_setup_latency_ms  : time from first PacketIn to FlowMod sent
   • flow_rules_installed   : total OFPFlowMod messages sent
@@ -34,6 +34,7 @@ Run
 """
 
 import json
+import os
 import time
 import atexit
 from collections import defaultdict
@@ -385,7 +386,10 @@ class SRMPLSController(app_manager.RyuApp):
         dp.send_msg(out)
 
     def _dump_metrics(self):
-        path = '/tmp/sr_mpls_metrics.json'
+        _dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           'results', 'data')
+        os.makedirs(_dir, exist_ok=True)
+        path = os.path.join(_dir, 'sr_mpls_metrics.json')
         lats = self._metrics['path_setup_latency_ms']
         rts  = self._metrics['reroute_latency_ms']
         out  = {

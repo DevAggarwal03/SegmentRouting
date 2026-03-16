@@ -250,9 +250,13 @@ def _synthetic_rows(mode):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _default_input  = os.path.join(_script_dir, 'data')
+    _default_output = os.path.join(_script_dir, 'figures')
+
     parser = argparse.ArgumentParser(description='SR Results Plotter')
-    parser.add_argument('--input',     default='/tmp/sr_results')
-    parser.add_argument('--output',    default='/tmp/sr_results/figures')
+    parser.add_argument('--input',     default=_default_input)
+    parser.add_argument('--output',    default=_default_output)
     parser.add_argument('--test-mode', action='store_true',
                         help='Use synthetic data (no Mininet results needed)')
     args = parser.parse_args()
@@ -266,8 +270,8 @@ def main():
         mpls_rows    = _synthetic_rows('sr-mpls')
         srv6_rows    = _synthetic_rows('srv6')
     else:
-        mpls_metrics = _load_metrics_json('/tmp/sr_mpls_metrics.json')
-        srv6_metrics = _load_metrics_json('/tmp/srv6_metrics.json')
+        mpls_metrics = _load_metrics_json(os.path.join(args.input, 'sr_mpls_metrics.json'))
+        srv6_metrics = _load_metrics_json(os.path.join(args.input, 'srv6_metrics.json'))
         mpls_rows    = _load_csv_dir(os.path.join(args.input, 'sr-mpls'))
         srv6_rows    = _load_csv_dir(os.path.join(args.input, 'srv6'))
 

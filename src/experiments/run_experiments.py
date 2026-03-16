@@ -37,6 +37,7 @@ import signal
 
 # Add src/ to path so we can import sibling modules
 SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_OUTPUT = os.path.join(SRC_DIR, 'results', 'data')
 sys.path.insert(0, SRC_DIR)
 
 from mininet.net import Mininet
@@ -163,7 +164,7 @@ def main():
     parser.add_argument('--delay',    type=str,   default='5ms', help='Link delay')
     parser.add_argument('--loss',     type=float, default=0,     help='Link loss %%')
     parser.add_argument('--duration', type=int,   default=30,    help='Bulk/mixed duration (s)')
-    parser.add_argument('--output',   default='/tmp/sr_results')
+    parser.add_argument('--output',   default=DEFAULT_OUTPUT)
     args = parser.parse_args()
 
     setLogLevel('warning')
