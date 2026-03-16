@@ -24,4 +24,4 @@ esac
 echo "[ryu] Starting controller in mode: $MODE"
 echo "[ryu] Script: $SCRIPT"
 
-ryu-manager --observe-links --wsapi-host 127.0.0.1 "$SCRIPT"
+ryu-manager --observe-links --wsapi-host 127.0.0.1 "$SCRIPT" ryu.app.ofctl_rest
