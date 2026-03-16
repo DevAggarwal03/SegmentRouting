@@ -1,5 +1,6 @@
 from ryu.base import app_manager
 from ryu.controller import ofp_event
+from ryu.controller import dpset
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 
@@ -20,8 +21,14 @@ class LoadBalancer(app_manager.RyuApp):
 
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
+    _CONTEXTS = {
+        'dpset': dpset.DPSet
+    }
+
     def __init__(self, *args, **kwargs):
         super(LoadBalancer, self).__init__(*args, **kwargs)
+
+        self.dpset = kwargs['dpset']
 
         self.mac_to_port = {}
         self.host_location = {}
@@ -143,6 +150,9 @@ class LoadBalancer(app_manager.RyuApp):
 
             datapath = self.get_datapath(sw)
 
+            if datapath is None:
+                continue
+
             parser = datapath.ofproto_parser
             ofproto = datapath.ofproto
 
@@ -156,10 +166,13 @@ class LoadBalancer(app_manager.RyuApp):
             )
 
             self.add_flow(datapath, 1, match, actions)
-        
-        dst_swtich = path[-1]
+
+        dst_switch = path[-1]
 
         datapath = self.get_datapath(dst_switch)
+
+        if datapath is None:
+            return
 
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
@@ -171,7 +184,7 @@ class LoadBalancer(app_manager.RyuApp):
             eth_dst=dst
         )
 
-        self.add_flow(datapath, 1, match, action)
+        self.add_flow(datapath, 1, match, actions)
 
     # ------------------------------
     # Add Flow
@@ -203,10 +216,11 @@ class LoadBalancer(app_manager.RyuApp):
     # ------------------------------
 
     def get_datapath(self, dpid):
+        return self.dpset.get(dpid)
 
-        for dp in self.dpset.get_all():
-            if dp.id == dpid:
-                return dp
+    # ------------------------------
+    # Topology Rebuild
+    # ------------------------------
 
     def build_topology(self):
 
