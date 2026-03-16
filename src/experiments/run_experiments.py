@@ -57,13 +57,13 @@ CONTROLLER_SCRIPTS = {
     'srv6':    os.path.join(SRC_DIR, 'controller', 'srv6_controller.py'),
 }
 
-RYU_BIN = 'ryu-manager'
+RYU_BIN = '/home/devnnd/.local/bin/ryu-manager'
 
 
 def start_controller(mode: str) -> subprocess.Popen:
     """Start Ryu controller in background and return its Popen handle."""
     script = CONTROLLER_SCRIPTS[mode]
-    cmd = [RYU_BIN, '--observe-links', '--wsapi-host', '127.0.0.1', script]
+        cmd = [RYU_BIN, '--observe-links', '--wsapi-host', '127.0.0.1', script]
     print(f'[orchestrator] Starting {mode} controller ...')
     proc = subprocess.Popen(cmd,
                             stdout=subprocess.PIPE,
